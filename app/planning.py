@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from fractions import Fraction
+from typing import Optional
 
 from .models import InventoryPlanIn, PlanRequest
 from .solver import Problem, Well
@@ -173,6 +174,11 @@ def cross_validate_inventory(req: InventoryPlanIn) -> None:
 def canonical_request(req) -> bytes:
     """Stable canonical serialization used for idempotency conflict checks."""
     data = req.model_dump()
+    # The stepwise flag is an *optional* extension: normalize the default
+    # value away so requests created before the feature existed keep the
+    # same frozen-hash replay semantics.
+    if data.get("execution_mode") == "whole":
+        data.pop("execution_mode", None)
 
     def norm(x):
         if isinstance(x, Fraction):
@@ -188,3 +194,110 @@ def canonical_request(req) -> bytes:
 
 def request_hash(req) -> str:
     return hashlib.sha256(canonical_request(req)).hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# Stepwise execution
+# --------------------------------------------------------------------------- #
+
+
+def frozen_transfer(plan: dict, step: int) -> Optional[dict]:
+    """The frozen transfer with the given step number, or ``None``."""
+    for t in plan.get("transfers", []):
+        if t["step"] == step:
+            return t
+    return None
+
+
+def transfers_match(frozen_transfer: dict, source: dict, destination: dict,
+                    volume_nl: int) -> bool:
+    """Whether a registered step is exactly the frozen step.
+
+    The registration must reproduce source, destination and volume verbatim
+    (same node kind/id/container and the same integer volume); a different
+    content is rejected even for the same step number.
+    """
+    if frozen_transfer["volume_nl"] != volume_nl:
+        return False
+    for label, registered in (("source", source), ("destination", destination)):
+        frozen_node = frozen_transfer[label]
+        if frozen_node.get("kind") != registered.get("kind"):
+            return False
+        if frozen_node.get("id") != registered.get("id"):
+            return False
+        if frozen_node.get("container") != registered.get("container"):
+            return False
+    return True
+
+
+def registered_stock_usage(steps: list[dict]) -> dict:
+    """Per-batch nanoliters *already drawn* by the registered step prefix.
+
+    Intermediate/diluent steps never move stock inventory: only a step whose
+    source is a stock batch counts, and each step is counted once (the steps
+    are a valid registration prefix -- no gaps, unique step numbers).
+    """
+    used: dict[str, int] = {}
+    seen = set()
+    for reg in steps:
+        n = reg["step"]
+        if n in seen:
+            continue
+        seen.add(n)
+        src = reg["source"]
+        if src.get("kind") == "stock" and src.get("id"):
+            used[src["id"]] = used.get(src["id"], 0) + reg["volume_nl"]
+    return used
+
+
+def stepwise_progress(frozen_plan: dict, registered_steps: list[dict],
+                      reservation_items: list[dict]) -> dict:
+    """Progress + per-batch used/pending bookkeeping for a stepwise plan.
+
+    ``used_nl`` is the volume whose stock-out step has already been
+    registered (and has therefore moved from reserved to used);
+    ``pending_nl`` is the frozen reservation not yet drawn and still
+    releasable on abort.
+    """
+    total_steps = len(frozen_plan.get("transfers", []))
+    done = sorted(s["step"] for s in registered_steps)
+    drawn = registered_stock_usage(registered_steps)
+    batch_progress = []
+    for item in reservation_items:
+        bid = item["batch_id"]
+        used = drawn.get(bid, 0)
+        batch_progress.append({
+            "batch_id": bid,
+            "reserved_total_nl": item["amount_nl"],
+            "used_nl": used,
+            "pending_nl": item["amount_nl"] - used,
+        })
+    return {
+        "total_steps": total_steps,
+        "registered_steps": done,
+        "registered_count": len(done),
+        "next_step": done[-1] + 1 if done else 1,
+        "complete": len(done) == total_steps and total_steps > 0,
+        "batch_progress": batch_progress,
+    }
+
+
+def executed_prefix_plan(plan: dict, registered_steps: list[int]) -> dict:
+    """The frozen plan restricted to its *executed* step prefix.
+
+    Recall impact for a partially executed stepwise plan is adjudicated only
+    along the transfers already registered: stock reserved for not-yet-taken
+    steps has never left the batch and must not appear in the report.
+    """
+    done = set(registered_steps)
+    out = dict(plan)
+    out["transfers"] = [t for t in plan.get("transfers", [])
+                        if t["step"] in done]
+    return out
+
+
+def traced_wells_for_executed_steps(plan: dict, batch_id: str,
+                                    registered_steps: list[int]) -> list[str]:
+    """Wells reached from ``batch_id`` through the executed step prefix only."""
+    return traced_wells_for_batch(
+        executed_prefix_plan(plan, registered_steps), batch_id)

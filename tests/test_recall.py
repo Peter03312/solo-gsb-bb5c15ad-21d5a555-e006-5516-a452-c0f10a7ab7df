@@ -41,6 +41,9 @@ def store(monkeypatch):
         ("get_reservation", st.get_reservation),
         ("reserve_and_freeze", st.reserve_and_freeze),
         ("transition_reservation", st.transition_reservation),
+        ("register_step", st.register_step),
+        ("complete_stepwise", st.complete_stepwise),
+        ("abort_stepwise", st.abort_stepwise),
         ("recall_batch", st.recall_batch),
         ("get_recall", st.get_recall),
     ]

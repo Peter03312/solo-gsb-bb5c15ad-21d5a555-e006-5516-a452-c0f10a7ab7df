@@ -53,17 +53,45 @@ ALTER TABLE batches ADD COLUMN IF NOT EXISTS recalled_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS reservations (
     request_id      TEXT PRIMARY KEY,
-    status          TEXT NOT NULL
-                    CHECK (status IN ('reserved', 'confirmed', 'cancelled')),
+    status          TEXT NOT NULL,
+    mode            TEXT NOT NULL DEFAULT 'whole'
+                    CHECK (mode IN ('whole', 'stepwise')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Migrate the reservations table created before stepwise mode: add the mode
+-- column and widen the status check constraint idempotently.
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS mode
+    TEXT NOT NULL DEFAULT 'whole';
+ALTER TABLE reservations DROP CONSTRAINT IF EXISTS reservations_status_check;
+ALTER TABLE reservations ADD CONSTRAINT reservations_status_check CHECK (
+    status IN ('reserved', 'confirmed', 'cancelled',
+               'stepwise', 'completed', 'aborted'));
+ALTER TABLE reservations DROP CONSTRAINT IF EXISTS reservations_mode_check;
+ALTER TABLE reservations ADD CONSTRAINT reservations_mode_check CHECK (
+    mode IN ('whole', 'stepwise'));
 
 CREATE TABLE IF NOT EXISTS reservation_items (
     request_id      TEXT NOT NULL REFERENCES reservations(request_id),
     batch_id        TEXT NOT NULL REFERENCES batches(batch_id),
     amount_nl       BIGINT NOT NULL CHECK (amount_nl > 0),
     PRIMARY KEY (request_id, batch_id)
+);
+
+-- One row per physically executed (registered) transfer of a stepwise plan.
+CREATE TABLE IF NOT EXISTS step_registrations (
+    request_id      TEXT NOT NULL REFERENCES reservations(request_id),
+    step            INTEGER NOT NULL CHECK (step >= 1),
+    source_kind     TEXT NOT NULL,
+    source_id       TEXT,
+    source_container TEXT,
+    destination_kind TEXT NOT NULL,
+    destination_id  TEXT,
+    destination_container TEXT,
+    volume_nl       BIGINT NOT NULL CHECK (volume_nl > 0),
+    registered_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (request_id, step)
 );
 
 CREATE TABLE IF NOT EXISTS recalls (
@@ -220,10 +248,13 @@ class _Abort(Exception):
 
 
 async def reserve_and_freeze(pool, request_id: str, request_hash: str,
-                             payload: dict, usage: dict):
+                             payload: dict, usage: dict, mode: str = "whole"):
     """Atomically freeze a feasible inventory plan and reserve its stock.
 
     ``usage`` maps batch_id -> nanoliters drawn from that batch by the plan.
+    ``mode`` is ``"whole"`` (reservation starts in status ``reserved`` and
+    follows the confirm/cancel lifecycle) or ``"stepwise"`` (reservation
+    starts in status ``stepwise`` and is executed one frozen step at a time).
     Everything happens in one transaction:
 
     1. insert the frozen plan row (first writer wins);
@@ -242,6 +273,7 @@ async def reserve_and_freeze(pool, request_id: str, request_hash: str,
     * ``"insufficient"`` - detail is a list of per-batch shortages; nothing
                            was reserved and nothing was frozen.
     """
+    initial_status = "stepwise" if mode == "stepwise" else "reserved"
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -299,9 +331,9 @@ async def reserve_and_freeze(pool, request_id: str, request_hash: str,
                         bid, usage[bid],
                     )
                 await conn.execute(
-                    "INSERT INTO reservations (request_id, status) "
-                    "VALUES ($1, 'reserved')",
-                    request_id,
+                    "INSERT INTO reservations (request_id, status, mode) "
+                    "VALUES ($1, $2, $3)",
+                    request_id, initial_status, mode,
                 )
                 if ids:
                     await conn.executemany(
@@ -316,10 +348,10 @@ async def reserve_and_freeze(pool, request_id: str, request_hash: str,
 
 
 async def get_reservation(pool, request_id: str) -> Optional[dict]:
-    """Return {request_id, status, items} or None."""
+    """Return {request_id, status, mode, items, steps} or None."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT status FROM reservations WHERE request_id = $1",
+            "SELECT status, mode FROM reservations WHERE request_id = $1",
             request_id,
         )
         if row is None:
@@ -329,11 +361,35 @@ async def get_reservation(pool, request_id: str) -> Optional[dict]:
             "WHERE request_id = $1 ORDER BY batch_id",
             request_id,
         )
+        steps = await conn.fetch(
+            """
+            SELECT step, source_kind, source_id, source_container,
+                   destination_kind, destination_id, destination_container,
+                   volume_nl
+            FROM step_registrations
+            WHERE request_id = $1 ORDER BY step
+            """,
+            request_id,
+        )
     return {
         "request_id": request_id,
         "status": row["status"],
+        "mode": row["mode"],
         "items": [{"batch_id": r["batch_id"], "amount_nl": r["amount_nl"]}
                   for r in items],
+        "steps": [_step_reg_dict(r) for r in steps],
+    }
+
+
+def _step_reg_dict(r) -> dict:
+    return {
+        "step": r["step"],
+        "source": {"kind": r["source_kind"], "id": r["source_id"],
+                   "container": r["source_container"]},
+        "destination": {"kind": r["destination_kind"],
+                        "id": r["destination_id"],
+                        "container": r["destination_container"]},
+        "volume_nl": r["volume_nl"],
     }
 
 
@@ -362,11 +418,18 @@ async def transition_reservation(pool, request_id: str, action: str):
     async with pool.acquire() as conn:
         async with conn.transaction():
             pre = await conn.fetchrow(
-                "SELECT status FROM reservations WHERE request_id = $1",
+                "SELECT status, mode FROM reservations WHERE request_id = $1",
                 request_id,
             )
             if pre is None:
                 return None
+            if pre["mode"] == "stepwise":
+                # Stepwise plans never use the whole-order confirm/cancel
+                # endpoints: registration/complete/abort are the only legal
+                # transitions.
+                return {"status": pre["status"], "mode": "stepwise",
+                        "changed": False, "items": [],
+                        "stepwise_rejected": True}
             items = await conn.fetch(
                 "SELECT batch_id, amount_nl FROM reservation_items "
                 "WHERE request_id = $1 ORDER BY batch_id",
@@ -432,6 +495,373 @@ async def transition_reservation(pool, request_id: str, action: str):
 
 
 # --------------------------------------------------------------------------- #
+# Stepwise execution
+# --------------------------------------------------------------------------- #
+
+
+_STEP_COLS = (
+    "step, source_kind, source_id, source_container, "
+    "destination_kind, destination_id, destination_container, volume_nl"
+)
+
+
+async def _registered_steps(conn, request_id: str) -> list[dict]:
+    rows = await conn.fetch(
+        f"SELECT {_STEP_COLS} FROM step_registrations "
+        "WHERE request_id = $1 ORDER BY step",
+        request_id,
+    )
+    return [_step_reg_dict(r) for r in rows]
+
+
+async def _lock_reservation_items(conn, request_id: str):
+    """Lock the reservation's batch rows (sorted) then the reservation row."""
+    items = await conn.fetch(
+        "SELECT batch_id, amount_nl FROM reservation_items "
+        "WHERE request_id = $1 ORDER BY batch_id",
+        request_id,
+    )
+    batch_ids = [r["batch_id"] for r in items]
+    recalled_rows = []
+    if batch_ids:
+        # Global lock order -- batches first, then the reservation row --
+        # identical to transition_reservation()/recall_batch(), so step
+        # registration and recalls cannot deadlock.
+        await conn.fetch(
+            "SELECT batch_id, recalled FROM batches "
+            "WHERE batch_id = ANY($1::text[]) ORDER BY batch_id FOR UPDATE",
+            batch_ids,
+        )
+        recalled_rows = await conn.fetch(
+            "SELECT batch_id FROM batches "
+            "WHERE batch_id = ANY($1::text[]) AND recalled",
+            batch_ids,
+        )
+    row = await conn.fetchrow(
+        "SELECT status, mode FROM reservations WHERE request_id = $1 "
+        "FOR UPDATE",
+        request_id,
+    )
+    return row, items, [r["batch_id"] for r in recalled_rows]
+
+
+async def register_step(pool, request_id: str, step: int, source: dict,
+                        destination: dict, volume_nl: int, frozen_step: dict):
+    """Register one physically executed frozen step.
+
+    All rules are settled in one transaction, locking the reservation's
+    batches (sorted) before the reservation row -- the same global order the
+    recall transaction uses -- so a concurrent recall is adjudicated on the
+    authoritative batch state (a recall that commits first blocks any further
+    step; a step that commits first has its stock moved to ``used_nl``).
+
+    Returns ``(outcome, detail)``:
+
+    * ``("ok", data)``         - step registered; if it is a stock-source
+                                 step, that step's volume moved from
+                                 ``reserved_nl`` to ``used_nl`` exactly once;
+    * ``("replay", data)``     - the step was already registered with the
+                                 same content; the original record is
+                                 returned and balances stay untouched;
+    * ``("unknown", None)``    - no reservation exists for ``request_id``;
+    * ``("not_stepwise", status)`` - the reservation is not a stepwise plan;
+    * ``("state", status)``    - status is not ``stepwise`` (completed /
+                                 aborted);
+    * ``("recalled", [batches])`` - a drawn batch has been recalled; no
+                                 further step may run;
+    * ``("step_conflict", {...})`` - jump/repeat/order mismatch
+                                 (``error`` names the precise case);
+    * ``("content_conflict", data)`` - same step, different source /
+                                 destination / volume; the frozen content
+                                 travels back in ``data["frozen"]``.
+    """
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                exists = await conn.fetchval(
+                    "SELECT TRUE FROM reservations WHERE request_id = $1",
+                    request_id,
+                )
+                if not exists:
+                    return "unknown", None
+                row, items, recalled = await _lock_reservation_items(
+                    conn, request_id)
+                status, mode = row["status"], row["mode"]
+                if mode != "stepwise":
+                    return "not_stepwise", status
+                if status != "stepwise":
+                    return "state", status
+                if recalled:
+                    return "recalled", sorted(recalled)
+
+                steps = await _registered_steps(conn, request_id)
+                done = sorted(s["step"] for s in steps)
+                existing = next((s for s in steps if s["step"] == step), None)
+                if existing is not None:
+                    same = (existing["source"] == source
+                            and existing["destination"] == destination
+                            and existing["volume_nl"] == volume_nl)
+                    if same:
+                        # Idempotent registration of the same step + content:
+                        # return the original record, accounts stay unchanged.
+                        data = await _stepwise_snapshot(
+                            conn, request_id, items, registered_just=False,
+                            step_record=existing)
+                        return "replay", data
+                    return "content_conflict", {"registered": existing,
+                                                "submitted": {
+                                                    "step": step,
+                                                    "source": source,
+                                                    "destination": destination,
+                                                    "volume_nl": volume_nl},
+                                                "frozen": frozen_step}
+                expected = done[-1] + 1 if done else 1
+                if step < expected:
+                    return "step_conflict", {
+                        "error": "step_already_registered",
+                        "step": step, "expected": expected}
+                if step > expected:
+                    return "step_conflict", {"error": "step_out_of_order",
+                                             "step": step,
+                                             "expected": expected}
+
+                # A stock-source step consumes real stock: move exactly this
+                # step's volume from reserved to used. Intermediate / diluent
+                # / well-source steps post no inventory movement.
+                stock_move = 0
+                if source.get("kind") == "stock" and source.get("id"):
+                    stock_move = volume_nl
+                    await conn.execute(
+                        "UPDATE batches SET reserved_nl = reserved_nl - $2, "
+                        "used_nl = used_nl + $2 WHERE batch_id = $1",
+                        source["id"], volume_nl,
+                    )
+                # The reservation FOR UPDATE already serializes registrations
+                # of one plan, so a winner's insert is visible to every later
+                # txn; ON CONFLICT is belt-and-braces against a duplicate.
+                inserted = await conn.fetchval(
+                    """
+                    INSERT INTO step_registrations (
+                        request_id, step, source_kind, source_id,
+                        source_container, destination_kind, destination_id,
+                        destination_container, volume_nl)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                    ON CONFLICT (request_id, step) DO NOTHING
+                    RETURNING step
+                    """,
+                    request_id, step,
+                    source.get("kind"), source.get("id"),
+                    source.get("container"),
+                    destination.get("kind"), destination.get("id"),
+                    destination.get("container"), volume_nl,
+                )
+                if inserted is None:
+                    winner = await conn.fetchrow(
+                        f"SELECT {_STEP_COLS} FROM step_registrations "
+                        "WHERE request_id = $1 AND step = $2",
+                        request_id, step,
+                    )
+                    existing = _step_reg_dict(winner)
+                    same = (existing["source"] == source
+                            and existing["destination"] == destination
+                            and existing["volume_nl"] == volume_nl)
+                    # Raising rolls this whole txn back (including the stock
+                    # movement); the except below replays the winner.
+                    raise _Abort(
+                        "replay" if same else "content_conflict",
+                        existing if same else
+                        {"registered": existing,
+                         "submitted": {"step": step, "source": source,
+                                       "destination": destination,
+                                       "volume_nl": volume_nl},
+                         "frozen": frozen_step})
+                await conn.execute(
+                    "UPDATE reservations SET updated_at = now() "
+                    "WHERE request_id = $1",
+                    request_id,
+                )
+                record = {"step": step, "source": source,
+                          "destination": destination,
+                          "volume_nl": volume_nl}
+                data = await _stepwise_snapshot(
+                    conn, request_id, items, registered_just=True,
+                    step_record=record, stock_move=stock_move)
+                return "ok", data
+    except _Abort as abort:
+        if abort.outcome not in ("replay", "content_conflict"):
+            raise
+        if abort.outcome == "content_conflict":
+            return "content_conflict", abort.detail
+        # The transaction rolled back; the winner committed, so re-read the
+        # authoritative state and replay its record.
+        async with pool.acquire() as conn2:
+            res = await conn2.fetchrow(
+                "SELECT status FROM reservations WHERE request_id = $1",
+                request_id,
+            )
+            items2 = await conn2.fetch(
+                "SELECT batch_id, amount_nl FROM reservation_items "
+                "WHERE request_id = $1 ORDER BY batch_id", request_id)
+            data = await _stepwise_snapshot(
+                conn2, request_id,
+                [{"batch_id": r["batch_id"], "amount_nl": r["amount_nl"]}
+                 for r in items2],
+                registered_just=False, step_record=abort.detail)
+            data["status"] = res["status"]
+        return "replay", data
+
+
+async def _stepwise_snapshot(conn, request_id, items, registered_just,
+                             step_record, stock_move=0):
+    steps = await _registered_steps(conn, request_id)
+    status = await conn.fetchval(
+        "SELECT status FROM reservations WHERE request_id = $1",
+        request_id,
+    )
+    return {
+        "request_id": request_id,
+        "status": status,
+        "step": step_record,
+        "registered_steps": [s["step"] for s in steps],
+        "registered_count": len(steps),
+        "steps": steps,
+        "items": [{"batch_id": r["batch_id"], "amount_nl": r["amount_nl"]}
+                  for r in items],
+        "just_registered": registered_just,
+        "stock_moved_nl": stock_move,
+    }
+
+
+async def complete_stepwise(pool, request_id: str):
+    """Finish a fully registered stepwise plan: ``stepwise -> completed``.
+
+    Completion posts no stock movement -- every stock step was already moved
+    to ``used_nl`` at registration time. It is refused until every frozen
+    step has been registered. Completion and abort are mutually exclusive
+    terminal transitions.
+
+    Returns ``(outcome, detail)``:
+    ``("ok"|"replay", data)``, ``("unknown", None)``,
+    ``("not_stepwise", status)``, ``("state", status)`` (aborted),
+    ``("incomplete", {"registered_count", "total_steps"})``.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            exists = await conn.fetchval(
+                "SELECT TRUE FROM reservations WHERE request_id = $1",
+                request_id,
+            )
+            if not exists:
+                return "unknown", None
+            row, items, _recalled = await _lock_reservation_items(
+                conn, request_id)
+            status, mode = row["status"], row["mode"]
+            if mode != "stepwise":
+                return "not_stepwise", status
+            if status == "completed":
+                steps = await _registered_steps(conn, request_id)
+                data = await _terminal_snapshot(conn, request_id, items,
+                                                steps, status)
+                return "replay", data
+            if status != "stepwise":  # aborted
+                return "state", status
+            steps = await _registered_steps(conn, request_id)
+            frozen = await conn.fetchval(
+                "SELECT jsonb_array_length(payload->'plan'->'transfers') "
+                "FROM plans WHERE request_id = $1",
+                request_id,
+            )
+            total = frozen or 0
+            if len(steps) != total:
+                return "incomplete", {"registered_count": len(steps),
+                                      "total_steps": total}
+            await conn.execute(
+                "UPDATE reservations SET status = 'completed', "
+                "updated_at = now() WHERE request_id = $1",
+                request_id,
+            )
+            data = await _terminal_snapshot(conn, request_id, items, steps,
+                                            "completed")
+            return "ok", data
+
+
+async def abort_stepwise(pool, request_id: str):
+    """Abort a stepwise plan: ``stepwise -> aborted``.
+
+    Already drawn stock stays in ``used_nl``; every batch volume reserved for
+    steps not yet taken is released back to the available pool **once**.
+    Abort remains legal even when a related batch has been recalled, and is
+    mutually exclusive with completion. Repeated abort is an idempotent
+    replay (no second release).
+
+    Returns ``(outcome, detail)``: ``("ok"|"replay", data)``,
+    ``("unknown", None)``, ``("not_stepwise", status)``,
+    ``("state", status)`` (completed).
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            exists = await conn.fetchval(
+                "SELECT TRUE FROM reservations WHERE request_id = $1",
+                request_id,
+            )
+            if not exists:
+                return "unknown", None
+            row, items, _recalled = await _lock_reservation_items(
+                conn, request_id)
+            status, mode = row["status"], row["mode"]
+            if mode != "stepwise":
+                return "not_stepwise", status
+            steps = await _registered_steps(conn, request_id)
+            if status == "aborted":
+                data = await _terminal_snapshot(conn, request_id, items,
+                                                steps, status)
+                return "replay", data
+            if status != "stepwise":  # completed
+                return "state", status
+
+            # Per-batch volume of stock-source steps already registered.
+            drawn: dict[str, int] = {}
+            for s in steps:
+                src = s["source"]
+                if src.get("kind") == "stock" and src.get("id"):
+                    drawn[src["id"]] = drawn.get(src["id"], 0) \
+                        + s["volume_nl"]
+            released = []
+            for r in items:
+                pending = r["amount_nl"] - drawn.get(r["batch_id"], 0)
+                if pending > 0:
+                    await conn.execute(
+                        "UPDATE batches SET reserved_nl = reserved_nl - $2 "
+                        "WHERE batch_id = $1",
+                        r["batch_id"], pending,
+                    )
+                released.append({"batch_id": r["batch_id"],
+                                 "released_nl": pending})
+            await conn.execute(
+                "UPDATE reservations SET status = 'aborted', "
+                "updated_at = now() WHERE request_id = $1",
+                request_id,
+            )
+            data = await _terminal_snapshot(conn, request_id, items, steps,
+                                            "aborted", released)
+            return "ok", data
+
+
+async def _terminal_snapshot(conn, request_id, items, steps, status,
+                             released=None):
+    return {
+        "request_id": request_id,
+        "status": status,
+        "registered_steps": [s["step"] for s in steps],
+        "registered_count": len(steps),
+        "steps": steps,
+        "items": [{"batch_id": r["batch_id"], "amount_nl": r["amount_nl"]}
+                  for r in items],
+        "released": released if released is not None else [],
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Batch recalls
 # --------------------------------------------------------------------------- #
 
@@ -484,16 +914,35 @@ async def recall_batch(pool, batch_id: str, reason: str, make_report):
                 return outcome, data
 
             # Serialize against concurrent confirm/cancel (which lock batches
-            # first, then reservations).
+            # first, then reservations) and against concurrent stepwise step
+            # registration (same global lock order).
             res_rows = await conn.fetch(
                 """
                 SELECT r.request_id AS request_id, r.status AS status,
-                       i.amount_nl AS amount_nl, p.payload AS payload
+                       r.mode AS mode,
+                       i.amount_nl AS amount_nl, p.payload AS payload,
+                       COALESCE((
+                           SELECT jsonb_agg(jsonb_build_object(
+                               'step', s.step,
+                               'source', jsonb_build_object(
+                                   'kind', s.source_kind,
+                                   'id', s.source_id,
+                                   'container', s.source_container),
+                               'destination', jsonb_build_object(
+                                   'kind', s.destination_kind,
+                                   'id', s.destination_id,
+                                   'container', s.destination_container),
+                               'volume_nl', s.volume_nl)
+                               ORDER BY s.step)
+                           FROM step_registrations s
+                           WHERE s.request_id = r.request_id
+                       ), '[]'::jsonb) AS steps
                 FROM reservation_items i
                 JOIN reservations r ON r.request_id = i.request_id
                 JOIN plans p ON p.request_id = i.request_id
                 WHERE i.batch_id = $1
-                  AND r.status IN ('reserved', 'confirmed')
+                  AND r.status IN ('reserved', 'confirmed',
+                                   'stepwise', 'completed')
                 ORDER BY r.request_id
                 FOR UPDATE OF r
                 """,
@@ -503,8 +952,10 @@ async def recall_batch(pool, batch_id: str, reason: str, make_report):
                 {
                     "request_id": r["request_id"],
                     "status": r["status"],
+                    "mode": r["mode"],
                     "amount_nl": r["amount_nl"],
                     "payload": json.loads(r["payload"]),
+                    "steps": json.loads(r["steps"]),
                 }
                 for r in res_rows
             ]

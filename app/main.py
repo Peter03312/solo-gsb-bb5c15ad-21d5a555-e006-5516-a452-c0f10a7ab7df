@@ -10,6 +10,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .db import (
+    abort_stepwise,
+    complete_stepwise,
     connect,
     create_batch,
     freeze,
@@ -20,20 +22,31 @@ from .db import (
     get_reservation,
     list_batches,
     recall_batch,
+    register_step,
     reserve_and_freeze,
     transition_reservation,
 )
-from .models import BatchRegisterIn, InventoryPlanIn, PlanRequest, RecallIn
+from .models import (
+    BatchRegisterIn,
+    InventoryPlanIn,
+    PlanRequest,
+    RecallIn,
+    StepRegistrationIn,
+)
 from .planning import (
     build_inventory_problem,
     build_problem,
     container_ids,
     cross_validate_inventory,
     cross_validate_references,
+    frozen_transfer,
     relabel_plan,
     request_hash,
+    stepwise_progress,
     stock_usage_from_plan,
     traced_wells_for_batch,
+    traced_wells_for_executed_steps,
+    transfers_match,
 )
 from .solver import solve
 
@@ -47,15 +60,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Microplate Dilution Planner",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Computes an exact, executable pipetting plan for microplate wells. "
         "Volumes are integer nanoliters; concentrations are rationals. "
         "Inventory mode plans against registered stock batches with atomic, "
         "oversell-proof reservations and a confirm/cancel lifecycle. "
-        "Contaminated batches can be irrevocably recalled: new reservations "
-        "and pending confirms are rejected, and the frozen recall report "
-        "traces affected plans and target wells through intermediate liquids."
+        "Inventory plans may alternatively run in stepwise execution mode: "
+        "the experimenter registers each frozen transfer in order, stock is "
+        "charged only as its stock-out steps are registered, and the plan is "
+        "completed or aborted explicitly. Contaminated batches can be "
+        "irrevocably recalled: new reservations and pending steps/confirms "
+        "are rejected, and the frozen recall report traces affected plans "
+        "and target wells (for stepwise plans, only the executed path) "
+        "through intermediate liquids."
     ),
     lifespan=lifespan,
 )
@@ -230,16 +248,42 @@ async def batch_detail(batch_id: str):
 def _build_recall_report(batch_id: str, candidates: list) -> dict:
     """Affected plans/wells for a batch, from live reservations + frozen plans.
 
-    Only reservations in ``reserved`` / ``confirmed`` state that actually drew
-    from the batch are present (a ``reservation_items`` row exists iff the
-    plan drew volume). Each target well reached from the batch through the
-    transfer chain (possibly via intermediate liquids) is listed once per
-    plan, annotated with that reservation's status.
+    Only reservations in ``reserved`` / ``confirmed`` / ``stepwise`` /
+    ``completed`` state that actually drew (or, for stepwise plans, have
+    already drawn) from the batch are present (a ``reservation_items`` row
+    exists iff the plan drew volume). Each target well reached from the
+    batch through the transfer chain (possibly via intermediate liquids) is
+    listed once per plan, annotated with that reservation's status.
+
+    For a stepwise plan the impact is adjudicated along the **executed
+    path**: the trace only crosses registered steps, and ``drawn_nl`` counts
+    only stock-source steps already registered -- stock reserved for
+    not-yet-taken steps has never left the batch and is excluded.
     """
     plans_out = []
     for c in candidates:
         payload = c["payload"]
         plan = payload.get("plan", {})
+        if c.get("mode") == "stepwise":
+            steps = c.get("steps", [])
+            done = [s["step"] for s in steps]
+            wells = traced_wells_for_executed_steps(plan, batch_id, done)
+            drawn = sum(s["volume_nl"] for s in steps
+                        if s.get("source", {}).get("kind") == "stock"
+                        and s.get("source", {}).get("id") == batch_id)
+            if drawn <= 0:
+                # Stock reserved but never taken: nothing reached any well
+                # from this batch.
+                continue
+            plans_out.append({
+                "request_id": c["request_id"],
+                "reservation_status": c["status"],
+                "execution_mode": "stepwise",
+                "drawn_nl": drawn,
+                "registered_steps": done,
+                "wells": wells,
+            })
+            continue
         wells = traced_wells_for_batch(plan, batch_id)
         plans_out.append({
             "request_id": c["request_id"],
@@ -396,6 +440,7 @@ async def create_inventory_plan(
 
     plan = relabel_plan(result.plan, container_ids(req))
     usage = stock_usage_from_plan(plan)
+    stepwise = req.execution_mode == "stepwise"
     payload = {
         "status": "feasible",
         "request_id": request_id,
@@ -404,10 +449,23 @@ async def create_inventory_plan(
             {"batch_id": bid, "reserved_nl": nl}
             for bid, nl in sorted(usage.items())
         ],
-        "reservation_status": "reserved",
+        "reservation_status": "stepwise" if stepwise else "reserved",
+        "execution_mode": "stepwise" if stepwise else "whole",
+        **({"progress": {
+            "total_steps": len(plan["transfers"]),
+            "registered_steps": [],
+            "registered_count": 0,
+            "next_step": 1,
+            "complete": False,
+            "batch_progress": [
+                {"batch_id": bid, "reserved_total_nl": nl,
+                 "used_nl": 0, "pending_nl": nl}
+                for bid, nl in sorted(usage.items())
+            ],
+        }} if stepwise else {}),
     }
     outcome, detail = await reserve_and_freeze(
-        app.state.db, request_id, rhash, payload, usage)
+        app.state.db, request_id, rhash, payload, usage, req.execution_mode)
     if outcome == "ok":
         return JSONResponse(status_code=201, content=payload)
     if outcome == "exists":
@@ -470,6 +528,12 @@ async def read_inventory_plan(request_id: str):
         # live reservation state on top of the frozen plan payload
         body["reservation_status"] = reservation["status"]
         body["reservation_items"] = reservation["items"]
+        body["execution_mode"] = reservation["mode"]
+        if reservation["mode"] == "stepwise":
+            body["progress"] = stepwise_progress(
+                payload.get("plan", {}),
+                reservation["steps"], reservation["items"])
+            body["step_registrations"] = reservation["steps"]
     code = 200 if status == "feasible" else 422
     return JSONResponse(status_code=code, content=body)
 
@@ -481,6 +545,23 @@ async def _transition(request_id: str, action: str) -> JSONResponse:
             status_code=404,
             content={"error": "not_found",
                      "detail": f"no reservation for request {request_id}"},
+        )
+    if result.get("stepwise_rejected"):
+        # A stepwise plan must never flow through the whole-order
+        # confirm/cancel endpoints; its lifecycle is registration +
+        # complete/abort.
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "stepwise_execution_mode",
+                "detail": "this plan was created in stepwise execution mode; "
+                          "register each frozen step via "
+                          "POST /inventory/plans/{request_id}/steps and finish "
+                          "via /complete or /abort -- whole-order "
+                          f"{action} is not allowed",
+                "request_id": request_id,
+                "status": result["status"],
+            },
         )
     target = "confirmed" if action == "confirm" else "cancelled"
     if action == "confirm" and result.get("recalled"):
@@ -529,3 +610,215 @@ async def confirm_inventory_plan(request_id: str):
 @app.post("/inventory/plans/{request_id}/cancel")
 async def cancel_inventory_plan(request_id: str):
     return await _transition(request_id, "cancel")
+
+
+# --------------------------------------------------------------------------- #
+# Stepwise execution lifecycle
+# --------------------------------------------------------------------------- #
+
+
+def _stepwise_progress_body(request_id: str, frozen_payload: dict,
+                            snapshot: dict) -> dict:
+    """Merge a db snapshot with frozen-plan step progress for a response."""
+    plan = frozen_payload.get("plan", {})
+    steps = snapshot.get("steps")
+    if steps is None:
+        # Terminal snapshots carry only the registered step numbers.
+        steps = [{"step": n, "source": {}}
+                 for n in snapshot.get("registered_steps", [])]
+    progress = stepwise_progress(plan, steps, snapshot["items"])
+    body = {
+        "request_id": request_id,
+        "execution_mode": "stepwise",
+        "reservation_status": snapshot.get("status", "stepwise"),
+        "status": snapshot.get("status", "stepwise"),
+        "step": snapshot.get("step"),
+        "registered_steps": snapshot.get("registered_steps", []),
+        "registered_count": snapshot.get("registered_count", 0),
+        "items": snapshot.get("items", []),
+        "progress": progress,
+    }
+    if "released" in snapshot:
+        body["released"] = snapshot["released"]
+    return body
+
+
+@app.post("/inventory/plans/{request_id}/steps")
+async def register_inventory_step(request_id: str, req: StepRegistrationIn):
+    frozen = await get_frozen(app.state.db, request_id)
+    if frozen is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found",
+                     "detail": f"no frozen plan for request {request_id}"},
+        )
+    _h, fstatus, payload = frozen
+    if fstatus != "feasible":
+        return JSONResponse(
+            status_code=409,
+            content={"error": "reservation_state_conflict",
+                     "detail": f"request {request_id} has no feasible frozen "
+                               "plan; steps cannot be registered"},
+        )
+    plan = payload.get("plan", {})
+    frozen_t = frozen_transfer(plan, req.step)
+    if frozen_t is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "step_not_found",
+                     "detail": f"frozen plan has no step {req.step}",
+                     "total_steps": len(plan.get("transfers", []))},
+        )
+    source = req.source.model_dump(exclude_none=False)
+    destination = req.destination.model_dump(exclude_none=False)
+    if not transfers_match(frozen_t, source, destination, req.volume_nl):
+        return JSONResponse(
+            status_code=409,
+            content={"error": "step_content_conflict",
+                     "detail": "registered transfer does not match the frozen "
+                               f"step {req.step}",
+                     "step": req.step,
+                     "submitted": {"source": source,
+                                   "destination": destination,
+                                   "volume_nl": req.volume_nl},
+                     "frozen": frozen_t},
+        )
+
+    outcome, detail = await register_step(
+        app.state.db, request_id, req.step, source, destination,
+        req.volume_nl, frozen_t)
+
+    if outcome == "unknown":
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found",
+                     "detail": f"no reservation for request {request_id}"},
+        )
+    if outcome == "not_stepwise":
+        return JSONResponse(
+            status_code=409,
+            content={"error": "whole_execution_mode",
+                     "detail": "this plan was created without stepwise "
+                               "execution mode; use the whole-order "
+                               "confirm/cancel endpoints instead",
+                     "request_id": request_id,
+                     "status": detail},
+        )
+    if outcome == "state":
+        return JSONResponse(
+            status_code=409,
+            content={"error": "reservation_state_conflict",
+                     "detail": f"stepwise plan is already {detail}; no more "
+                               "steps can be registered",
+                     "request_id": request_id,
+                     "status": detail},
+        )
+    if outcome == "recalled":
+        return JSONResponse(
+            status_code=409,
+            content={"error": "batch_recalled",
+                     "detail": "a batch of this plan has been recalled; "
+                               "further step execution is forbidden (the plan "
+                               "can still be aborted): "
+                               + ", ".join(detail),
+                     "request_id": request_id,
+                     "recalled_batches": detail},
+        )
+    if outcome == "content_conflict":
+        return JSONResponse(
+            status_code=409,
+            content={"error": "step_content_conflict",
+                     "detail": f"step {req.step} was already registered with "
+                               "different content",
+                     "step": req.step,
+                     "registered": detail["registered"],
+                     "submitted": detail["submitted"],
+                     "frozen": detail["frozen"]},
+        )
+    if outcome == "step_conflict":
+        return JSONResponse(
+            status_code=409,
+            content={"error": detail["error"],
+                     "detail": f"step {detail['step']} is not the next "
+                               f"expected step {detail['expected']}",
+                     "step": detail["step"],
+                     "expected": detail["expected"]},
+        )
+    # outcome in ("ok", "replay"): build a progress-rich body
+    body = _stepwise_progress_body(request_id, payload, detail)
+    body["changed"] = outcome == "ok"
+    if outcome == "ok":
+        body["stock_moved_nl"] = detail.get("stock_moved_nl", 0)
+    return JSONResponse(status_code=201 if outcome == "ok" else 200,
+                        content=body)
+
+
+def _terminal_reply(request_id: str, outcome: str, detail,
+                    payload) -> JSONResponse:
+    if outcome == "unknown":
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found",
+                     "detail": f"no reservation for request {request_id}"},
+        )
+    if outcome == "not_stepwise":
+        return JSONResponse(
+            status_code=409,
+            content={"error": "whole_execution_mode",
+                     "detail": "this plan was created without stepwise "
+                               "execution mode; use the whole-order "
+                               "confirm/cancel endpoints instead",
+                     "request_id": request_id,
+                     "status": detail},
+        )
+    if outcome == "state":
+        verb = {"aborted": "aborted", "completed": "completed"}[detail]
+        return JSONResponse(
+            status_code=409,
+            content={"error": "reservation_state_conflict",
+                     "detail": f"stepwise plan is already {verb}; completion "
+                               "and abort are mutually exclusive",
+                     "request_id": request_id,
+                     "status": detail},
+        )
+    if outcome == "incomplete":
+        return JSONResponse(
+            status_code=409,
+            content={"error": "plan_incomplete",
+                     "detail": "not all frozen steps have been registered",
+                     "request_id": request_id,
+                     **detail},
+        )
+    # ok / replay
+    body = _stepwise_progress_body(request_id, payload, detail)
+    body["changed"] = outcome == "ok"
+    if "released" in detail:
+        body["released"] = detail["released"]
+    return JSONResponse(status_code=200 if outcome == "replay" else 201,
+                        content=body)
+
+
+@app.post("/inventory/plans/{request_id}/complete")
+async def complete_inventory_plan(request_id: str):
+    frozen = await get_frozen(app.state.db, request_id)
+    if frozen is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found",
+                     "detail": f"no frozen plan for request {request_id}"},
+        )
+    outcome, detail = await complete_stepwise(app.state.db, request_id)
+    return _terminal_reply(request_id, outcome, detail, frozen[2])
+
+
+@app.post("/inventory/plans/{request_id}/abort")
+async def abort_inventory_plan(request_id: str):
+    frozen = await get_frozen(app.state.db, request_id)
+    if frozen is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found",
+                     "detail": f"no frozen plan for request {request_id}"},
+        )
+    outcome, detail = await abort_stepwise(app.state.db, request_id)
+    return _terminal_reply(request_id, outcome, detail, frozen[2])

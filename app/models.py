@@ -8,7 +8,7 @@ Volumes are always integer nanoliters.
 from __future__ import annotations
 
 from fractions import Fraction
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -161,7 +161,17 @@ class BatchRegisterIn(BaseModel):
 
 class InventoryPlanIn(BaseModel):
     """Plan request that draws from registered batches instead of
-    request-local stock definitions."""
+    request-local stock definitions.
+
+    ``execution_mode`` selects the lifecycle:
+
+    * ``"whole"`` (default): the existing create + whole-order
+      confirm/cancel semantics;
+    * ``"stepwise"``: transfers are registered one frozen step at a time by
+      the experimenter; each stock-source registration moves that step's
+      reserved volume to ``used_nl``, and the plan is finalized (``complete``)
+      or ``abort``ed explicitly.
+    """
     batch_ids: list[str] = Field(min_length=1)
     diluent: DiluentIn
     wells: list[WellIn] = Field(min_length=1)
@@ -169,6 +179,7 @@ class InventoryPlanIn(BaseModel):
     pipette: PipetteIn
     default_well_capacity_nl: int = Field(gt=0)
     limits: LimitsIn = Field(default_factory=LimitsIn)
+    execution_mode: Literal["whole", "stepwise"] = "whole"
 
     @field_validator("batch_ids")
     @classmethod
@@ -192,6 +203,27 @@ class RecallIn(BaseModel):
         if not v.strip():
             raise ValueError("reason must not be blank")
         return v
+
+
+# --------------------------------------------------------------------------- #
+# Stepwise execution
+# --------------------------------------------------------------------------- #
+
+
+class NodeIn(BaseModel):
+    """A transfer endpoint exactly as it appears in the frozen plan."""
+    kind: Literal["stock", "diluent", "intermediate", "well"]
+    id: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    container: Optional[str] = Field(default=None, min_length=1,
+                                    max_length=64)
+
+
+class StepRegistrationIn(BaseModel):
+    """Experimenter registration that one frozen step was physically run."""
+    step: int = Field(ge=1)
+    source: NodeIn
+    destination: NodeIn
+    volume_nl: int = Field(gt=0)
 
 
 # --------------------------------------------------------------------------- #

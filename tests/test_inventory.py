@@ -33,7 +33,8 @@ class FakeStore:
     def __init__(self):
         self.plans = {}         # request_id -> (hash, status, payload)
         self.batches = {}       # batch_id -> mutable row dict
-        self.reservations = {}  # request_id -> {"status", "items"}
+        self.reservations = {}  # request_id -> {"status","mode","items",
+        #                          "steps": {step: record}}
         self.recalls = {}       # batch_id -> {"reason", "report", ...}
 
     # -- batches ----------------------------------------------------------- #
@@ -88,7 +89,7 @@ class FakeStore:
     # -- reservations -------------------------------------------------------- #
 
     async def reserve_and_freeze(self, conn, request_id, rhash, payload,
-                                 usage):
+                                 usage, mode="whole"):
         # atomic: no awaits between the checks and the updates
         if request_id in self.plans:
             return "exists", None
@@ -115,9 +116,11 @@ class FakeStore:
         for bid, amount in usage.items():
             self.batches[bid]["reserved_nl"] += amount
         self.reservations[request_id] = {
-            "status": "reserved",
+            "status": "stepwise" if mode == "stepwise" else "reserved",
+            "mode": mode,
             "items": [{"batch_id": bid, "amount_nl": amount}
                       for bid, amount in sorted(usage.items())],
+            "steps": {},
         }
         return "ok", None
 
@@ -126,13 +129,20 @@ class FakeStore:
         if r is None:
             return None
         return {"request_id": request_id, "status": r["status"],
-                "items": [dict(i) for i in r["items"]]}
+                "mode": r["mode"],
+                "items": [dict(i) for i in r["items"]],
+                "steps": [dict(s) for s in
+                          (r["steps"][n] for n in sorted(r["steps"]))]}
 
     async def transition_reservation(self, conn, request_id, action):
         # atomic: no awaits between the check and the updates
         r = self.reservations.get(request_id)
         if r is None:
             return None
+        if r["mode"] == "stepwise":
+            return {"status": r["status"], "mode": "stepwise",
+                    "changed": False, "items": [],
+                    "stepwise_rejected": True}
         result = {"status": r["status"], "changed": False,
                   "items": [dict(i) for i in r["items"]]}
         if r["status"] != "reserved":
@@ -153,6 +163,127 @@ class FakeStore:
         result["changed"] = True
         return result
 
+    # -- stepwise execution -------------------------------------------------- #
+
+    @staticmethod
+    def _step_pub(rec):
+        return {"step": rec["step"], "source": dict(rec["source"]),
+                "destination": dict(rec["destination"]),
+                "volume_nl": rec["volume_nl"]}
+
+    def _step_snapshot(self, rid, record, just, stock_move=0):
+        r = self.reservations[rid]
+        steps = [self._step_pub(r["steps"][n]) for n in sorted(r["steps"])]
+        return {
+            "request_id": rid,
+            "status": r["status"],
+            "step": record,
+            "registered_steps": [s["step"] for s in steps],
+            "registered_count": len(steps),
+            "steps": steps,
+            "items": [dict(i) for i in r["items"]],
+            "just_registered": just,
+            "stock_moved_nl": stock_move,
+        }
+
+    async def register_step(self, conn, request_id, step, source,
+                            destination, volume_nl, frozen_step):
+        # atomic: no awaits between the checks and the updates
+        r = self.reservations.get(request_id)
+        if r is None:
+            return "unknown", None
+        if r["mode"] != "stepwise":
+            return "not_stepwise", r["status"]
+        if r["status"] != "stepwise":
+            return "state", r["status"]
+        recalled = [i["batch_id"] for i in r["items"]
+                    if self.batches[i["batch_id"]].get("recalled")]
+        if recalled:
+            return "recalled", sorted(recalled)
+        record = {"step": step, "source": dict(source),
+                  "destination": dict(destination), "volume_nl": volume_nl}
+        if step in r["steps"]:
+            existing = self._step_pub(r["steps"][step])
+            if (existing["source"] == source
+                    and existing["destination"] == destination
+                    and existing["volume_nl"] == volume_nl):
+                return "replay", self._step_snapshot(request_id, existing,
+                                                     False)
+            return "content_conflict", {"registered": existing,
+                                        "submitted": record,
+                                        "frozen": frozen_step}
+        done = sorted(r["steps"])
+        expected = done[-1] + 1 if done else 1
+        if step != expected:
+            code = ("step_already_registered" if step < expected
+                    else "step_out_of_order")
+            return "step_conflict", {"error": code, "step": step,
+                                     "expected": expected}
+        stock_move = 0
+        if source.get("kind") == "stock" and source.get("id"):
+            stock_move = volume_nl
+            b = self.batches[source["id"]]
+            b["reserved_nl"] -= volume_nl
+            b["used_nl"] += volume_nl
+        r["steps"][step] = record
+        return "ok", self._step_snapshot(
+            request_id, self._step_pub(record), True, stock_move)
+
+    def _terminal_snapshot(self, rid, released=None):
+        r = self.reservations[rid]
+        steps = [self._step_pub(r["steps"][n]) for n in sorted(r["steps"])]
+        return {
+            "request_id": rid,
+            "status": r["status"],
+            "registered_steps": [s["step"] for s in steps],
+            "registered_count": len(steps),
+            "steps": steps,
+            "items": [dict(i) for i in r["items"]],
+            "released": released if released is not None else [],
+        }
+
+    async def complete_stepwise(self, conn, request_id):
+        r = self.reservations.get(request_id)
+        if r is None:
+            return "unknown", None
+        if r["mode"] != "stepwise":
+            return "not_stepwise", r["status"]
+        if r["status"] == "completed":
+            return "replay", self._terminal_snapshot(request_id)
+        if r["status"] != "stepwise":
+            return "state", r["status"]
+        total = len(self.plans[request_id][2]["plan"]["transfers"])
+        if len(r["steps"]) != total:
+            return "incomplete", {"registered_count": len(r["steps"]),
+                                  "total_steps": total}
+        r["status"] = "completed"
+        return "ok", self._terminal_snapshot(request_id)
+
+    async def abort_stepwise(self, conn, request_id):
+        r = self.reservations.get(request_id)
+        if r is None:
+            return "unknown", None
+        if r["mode"] != "stepwise":
+            return "not_stepwise", r["status"]
+        if r["status"] == "aborted":
+            return "replay", self._terminal_snapshot(request_id)
+        if r["status"] != "stepwise":
+            return "state", r["status"]
+        drawn = {}
+        for rec in r["steps"].values():
+            src = rec["source"]
+            if src.get("kind") == "stock" and src.get("id"):
+                drawn[src["id"]] = drawn.get(src["id"], 0) + rec["volume_nl"]
+        released = []
+        for item in r["items"]:
+            pending = item["amount_nl"] - drawn.get(item["batch_id"], 0)
+            if pending > 0:
+                self.batches[item["batch_id"]]["reserved_nl"] -= pending
+            released.append({"batch_id": item["batch_id"],
+                             "released_nl": pending})
+        r["status"] = "aborted"
+        return "ok", self._terminal_snapshot(request_id, released)
+
     # -- recalls ------------------------------------------------------------ #
 
     async def recall_batch(self, conn, batch_id, reason, make_report):
@@ -167,15 +298,19 @@ class FakeStore:
         candidates = []
         for rid in sorted(self.reservations):
             r = self.reservations[rid]
-            if r["status"] not in ("reserved", "confirmed"):
+            if r["status"] not in ("reserved", "confirmed",
+                                   "stepwise", "completed"):
                 continue
             for item in r["items"]:
                 if item["batch_id"] == batch_id:
                     candidates.append({
                         "request_id": rid,
                         "status": r["status"],
+                        "mode": r["mode"],
                         "amount_nl": item["amount_nl"],
                         "payload": self.plans[rid][2],
+                        "steps": [dict(r["steps"][n])
+                                  for n in sorted(r["steps"])],
                     })
         report = make_report(candidates)
         data = {"batch_id": batch_id, "reason": reason,
@@ -212,6 +347,9 @@ def store(monkeypatch):
         ("get_reservation", st.get_reservation),
         ("reserve_and_freeze", st.reserve_and_freeze),
         ("transition_reservation", st.transition_reservation),
+        ("register_step", st.register_step),
+        ("complete_stepwise", st.complete_stepwise),
+        ("abort_stepwise", st.abort_stepwise),
         ("recall_batch", st.recall_batch),
         ("get_recall", st.get_recall),
     ]
