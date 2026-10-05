@@ -8,7 +8,7 @@ Volumes are always integer nanoliters.
 from __future__ import annotations
 
 from fractions import Fraction
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -161,7 +161,18 @@ class BatchRegisterIn(BaseModel):
 
 class InventoryPlanIn(BaseModel):
     """Plan request that draws from registered batches instead of
-    request-local stock definitions."""
+    request-local stock definitions.
+
+    ``execution_mode`` selects how the reservation is consumed:
+
+    * ``"whole"`` (default): the existing whole-order confirm/cancel
+      lifecycle -- the whole drawn volume moves reserved -> used (or is
+      released) in one call;
+    * ``"stepwise"``: the lab registers every frozen transfer one by one;
+      stock-draw steps move the batch reservation to used as they happen,
+      and the plan can only be completed after all steps are registered
+      (or aborted, which keeps the used volume and releases the rest).
+    """
     batch_ids: list[str] = Field(min_length=1)
     diluent: DiluentIn
     wells: list[WellIn] = Field(min_length=1)
@@ -169,6 +180,7 @@ class InventoryPlanIn(BaseModel):
     pipette: PipetteIn
     default_well_capacity_nl: int = Field(gt=0)
     limits: LimitsIn = Field(default_factory=LimitsIn)
+    execution_mode: Literal["whole", "stepwise"] = "whole"
 
     @field_validator("batch_ids")
     @classmethod
@@ -179,6 +191,33 @@ class InventoryPlanIn(BaseModel):
             if b.startswith("@"):
                 raise ValueError(
                     "ids must not start with '@' (reserved prefix)")
+        return v
+
+
+class NodeRefIn(BaseModel):
+    kind: str = Field(min_length=1, max_length=16)
+    id: Optional[str] = Field(default=None, max_length=64)
+    container: Optional[str] = Field(default=None, max_length=64)
+
+
+class StepRegistrationIn(BaseModel):
+    """One lab-confirmed transfer execution in a stepwise plan.
+
+    The content must match the frozen step with that number exactly
+    (source / destination / volume); registering the next step out of
+    order, or a step with different content, is rejected.
+    """
+    step: int = Field(ge=1)
+    source: NodeRefIn
+    destination: NodeRefIn
+    volume_nl: int = Field(gt=0)
+
+    @field_validator("source", "destination")
+    @classmethod
+    def _node(cls, v):
+        if v.kind not in ("stock", "diluent", "intermediate", "well"):
+            raise ValueError(
+                "node kind must be one of stock/diluent/intermediate/well")
         return v
 
 

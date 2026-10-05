@@ -88,7 +88,7 @@ class FakeStore:
     # -- reservations -------------------------------------------------------- #
 
     async def reserve_and_freeze(self, conn, request_id, rhash, payload,
-                                 usage):
+                                 usage, execution_mode="whole"):
         # atomic: no awaits between the checks and the updates
         if request_id in self.plans:
             return "exists", None
@@ -116,8 +116,10 @@ class FakeStore:
             self.batches[bid]["reserved_nl"] += amount
         self.reservations[request_id] = {
             "status": "reserved",
+            "execution_mode": execution_mode,
             "items": [{"batch_id": bid, "amount_nl": amount}
                       for bid, amount in sorted(usage.items())],
+            "steps": [],
         }
         return "ok", None
 
@@ -126,13 +128,19 @@ class FakeStore:
         if r is None:
             return None
         return {"request_id": request_id, "status": r["status"],
-                "items": [dict(i) for i in r["items"]]}
+                "execution_mode": r.get("execution_mode", "whole"),
+                "items": [dict(i) for i in r["items"]],
+                "steps": [dict(s) for s in r.get("steps", [])]}
 
     async def transition_reservation(self, conn, request_id, action):
         # atomic: no awaits between the check and the updates
         r = self.reservations.get(request_id)
         if r is None:
             return None
+        if r.get("execution_mode") == "stepwise":
+            return {"status": r["status"], "changed": False,
+                    "items": [dict(i) for i in r["items"]],
+                    "mode_conflict": "stepwise"}
         result = {"status": r["status"], "changed": False,
                   "items": [dict(i) for i in r["items"]]}
         if r["status"] != "reserved":
@@ -153,6 +161,95 @@ class FakeStore:
         result["changed"] = True
         return result
 
+    # -- stepwise execution ------------------------------------------------- #
+
+    async def register_step(self, conn, request_id, step_no, transfer):
+        # atomic: no awaits between the check and the updates
+        r = self.reservations.get(request_id)
+        if r is None:
+            return "missing", None
+        if r.get("execution_mode") != "stepwise":
+            return "mode_conflict", None
+        if r["status"] in ("completed", "aborted"):
+            return "state_conflict", {"status": r["status"]}
+        source = transfer["source"]
+        destination = transfer["destination"]
+        volume = transfer["volume_nl"]
+        for existing in r["steps"]:
+            if existing["step"] == step_no:
+                same = (existing["source"] == source
+                        and existing["destination"] == destination
+                        and existing["volume_nl"] == volume)
+                if not same:
+                    return "mismatch", {"step": step_no,
+                                        "existing": dict(existing)}
+                return "replay", dict(existing)
+        if step_no != len(r["steps"]) + 1:
+            return "out_of_order", {"expected": len(r["steps"]) + 1,
+                                    "received": step_no}
+        recalled = [i["batch_id"] for i in r["items"]
+                    if self.batches[i["batch_id"]].get("recalled")]
+        if recalled:
+            return "recalled", sorted(recalled)
+        batch_id = source["id"] if source.get("kind") == "stock" else None
+        r["steps"].append({"step": step_no, "source": source,
+                           "destination": destination, "volume_nl": volume,
+                           "batch_id": batch_id})
+        if batch_id is not None:
+            # mother-liquor draw converts reservation to used now;
+            # intermediate/diluent steps debit nothing again.
+            self.batches[batch_id]["reserved_nl"] -= volume
+            self.batches[batch_id]["used_nl"] += volume
+        used = {}
+        for s in r["steps"]:
+            if s["batch_id"] is not None:
+                used[s["batch_id"]] = used.get(s["batch_id"], 0) \
+                    + s["volume_nl"]
+        return "ok", {"step": step_no, "status": r["status"],
+                      "steps": [dict(s) for s in r["steps"]],
+                      "executed_count": len(r["steps"]), "used": used}
+
+    async def _finalize_stepwise(self, conn, request_id, action):
+        r = self.reservations.get(request_id)
+        if r is None:
+            return "missing", None
+        if r.get("execution_mode") != "stepwise":
+            return "mode_conflict", None
+        target = "completed" if action == "complete" else "aborted"
+        if r["status"] == target:
+            return "replay", {"status": target}
+        if r["status"] in ("completed", "aborted"):
+            return "state_conflict", {"status": r["status"]}
+        total = len(self.plans[request_id][2]["plan"]["transfers"])
+        if action == "complete":
+            if len(r["steps"]) < total:
+                return "not_all_steps", {"executed": len(r["steps"]),
+                                         "total": total}
+        else:
+            used = {}
+            for s in r["steps"]:
+                if s["batch_id"] is not None:
+                    used[s["batch_id"]] = used.get(s["batch_id"], 0) \
+                        + s["volume_nl"]
+            released = []
+            for item in r["items"]:
+                rest = item["amount_nl"] - used.get(item["batch_id"], 0)
+                if rest > 0:
+                    self.batches[item["batch_id"]]["reserved_nl"] -= rest
+                    released.append({"batch_id": item["batch_id"],
+                                     "released_nl": rest})
+        r["status"] = target
+        detail = {"status": target}
+        if action == "abort":
+            detail["released"] = released
+        return "ok", detail
+
+    async def complete_stepwise(self, conn, request_id):
+        return await self._finalize_stepwise(conn, request_id, "complete")
+
+    async def abort_stepwise(self, conn, request_id):
+        return await self._finalize_stepwise(conn, request_id, "abort")
+
     # -- recalls ------------------------------------------------------------ #
 
     async def recall_batch(self, conn, batch_id, reason, make_report):
@@ -167,16 +264,34 @@ class FakeStore:
         candidates = []
         for rid in sorted(self.reservations):
             r = self.reservations[rid]
-            if r["status"] not in ("reserved", "confirmed"):
-                continue
-            for item in r["items"]:
-                if item["batch_id"] == batch_id:
-                    candidates.append({
-                        "request_id": rid,
-                        "status": r["status"],
-                        "amount_nl": item["amount_nl"],
-                        "payload": self.plans[rid][2],
-                    })
+            mode = r.get("execution_mode", "whole")
+            if mode == "stepwise":
+                if r["status"] not in ("reserved", "completed", "aborted"):
+                    continue
+                drawn = sum(s["volume_nl"] for s in r["steps"]
+                            if s["batch_id"] == batch_id)
+                if drawn <= 0:
+                    # un-drawn mother liquor never counts
+                    continue
+                executed_steps = len(r["steps"])
+            else:
+                if r["status"] not in ("reserved", "confirmed"):
+                    continue
+                item = next((i for i in r["items"]
+                             if i["batch_id"] == batch_id), None)
+                if item is None:
+                    continue
+                drawn = item["amount_nl"]
+                executed_steps = None
+            candidates.append({
+                "request_id": rid,
+                "status": r["status"],
+                "execution_mode": mode,
+                "amount_nl": item["amount_nl"] if mode == "whole" else drawn,
+                "drawn_nl": drawn,
+                "executed_steps": executed_steps,
+                "payload": self.plans[rid][2],
+            })
         report = make_report(candidates)
         data = {"batch_id": batch_id, "reason": reason,
                 "recalled_at": "2026-01-01T00:00:00+00:00",
@@ -212,6 +327,9 @@ def store(monkeypatch):
         ("get_reservation", st.get_reservation),
         ("reserve_and_freeze", st.reserve_and_freeze),
         ("transition_reservation", st.transition_reservation),
+        ("register_step", st.register_step),
+        ("complete_stepwise", st.complete_stepwise),
+        ("abort_stepwise", st.abort_stepwise),
         ("recall_batch", st.recall_batch),
         ("get_recall", st.get_recall),
     ]

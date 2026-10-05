@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from fractions import Fraction
+from typing import Optional
 
 from .models import InventoryPlanIn, PlanRequest
 from .solver import Problem, Well
@@ -72,6 +73,43 @@ def stock_usage_from_plan(plan: dict) -> dict:
     return usage
 
 
+def transfer_matches(registered: dict, frozen: dict) -> bool:
+    """Whether a registered execution matches a frozen transfer exactly.
+
+    Node references must be identical as serialized (kind plus stock/well id
+    or intermediate id+container), and so must the volume.
+    """
+    return (registered.get("source") == frozen.get("source")
+            and registered.get("destination") == frozen.get("destination")
+            and registered.get("volume_nl") == frozen.get("volume_nl"))
+
+
+def frozen_step(plan: dict, step_no: int) -> Optional[dict]:
+    """The frozen transfer numbered ``step_no`` (steps start at 1)."""
+    for t in plan["transfers"]:
+        if t["step"] == step_no:
+            return t
+    return None
+
+
+def total_steps(plan: dict) -> int:
+    return len(plan["transfers"])
+
+
+def stock_usage_for_steps(plan: dict, executed_count: int) -> dict:
+    """Per-batch nanoliters drawn by the first ``executed_count`` transfers.
+
+    Only stock-drawing (mother-liquor) steps consume batch volume: transfers
+    out of intermediate liquids never debit a batch again.
+    """
+    usage: dict[str, int] = {}
+    for t in plan["transfers"][:executed_count]:
+        src = t["source"]
+        if src.get("kind") == "stock":
+            usage[src["id"]] = usage.get(src["id"], 0) + t["volume_nl"]
+    return usage
+
+
 def _node_key(node: dict) -> tuple:
     """Identity key for a transfer endpoint.
 
@@ -88,18 +126,26 @@ def _node_key(node: dict) -> tuple:
     return (kind, node.get("id"))
 
 
-def traced_wells_for_batch(plan: dict, batch_id: str) -> list[str]:
+def traced_wells_for_batch(plan: dict, batch_id: str,
+                           upto_step: Optional[int] = None) -> list[str]:
     """Wells that receive liquid originating from ``batch_id``.
 
     The trace follows transfer steps forward from the batch stock through any
     intermediate vessels to the target wells, so wells reached only through a
     serial-dilution chain are included. Each well is reported at most once,
     in first-reach (transfer-step) order.
+
+    When ``upto_step`` is given, only the first that many frozen transfers are
+    considered (a stepwise plan's *executed path*): un-drawn mother liquor and
+    not-yet-performed transfers do not contribute.
     """
     reached = {("stock", batch_id)}
     wells: list[str] = []
     seen = set()
-    for t in plan["transfers"]:
+    transfers = plan["transfers"]
+    if upto_step is not None:
+        transfers = transfers[:upto_step]
+    for t in transfers:
         src = _node_key(t["source"])
         dst = t["destination"]
         if src not in reached:
